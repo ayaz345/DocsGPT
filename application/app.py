@@ -90,20 +90,17 @@ vectors_collection = db["vectors"]
 
 
 async def async_generate(chain, question, chat_history):
-    result = await chain.arun({"question": question, "chat_history": chat_history})
-    return result
+    return await chain.arun({"question": question, "chat_history": chat_history})
 
 
 def run_async_chain(chain, question, chat_history):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    result = {}
     try:
         answer = loop.run_until_complete(async_generate(chain, question, chat_history))
     finally:
         loop.close()
-    result["answer"] = answer
-    return result
+    return {"answer": answer}
 
 
 def get_vectorstore(data):
@@ -136,8 +133,7 @@ def get_docsearch(vectorstore, embeddings_key):
 
 @celery.task(bind=True)
 def ingest(self, directory, formats, name_job, filename, user):
-    resp = ingest_worker(self, directory, formats, name_job, filename, user)
-    return resp
+    return ingest_worker(self, directory, formats, name_job, filename, user)
 
 
 @app.route("/")
@@ -197,10 +193,7 @@ def stream():
 
     # check if active_docs is set
 
-    if not api_key_set:
-        api_key = request.args.get("api_key")
-    else:
-        api_key = settings.API_KEY
+    api_key = request.args.get("api_key") if not api_key_set else settings.API_KEY
     if not embeddings_key_set:
         embeddings_key = request.args.get("embeddings_key")
     else:
@@ -223,10 +216,7 @@ def api_answer():
     question = data["question"]
     history = data["history"]
     print("-" * 5)
-    if not api_key_set:
-        api_key = data["api_key"]
-    else:
-        api_key = settings.API_KEY
+    api_key = data["api_key"] if not api_key_set else settings.API_KEY
     if not embeddings_key_set:
         embeddings_key = data["embeddings_key"]
     else:
@@ -283,7 +273,7 @@ def api_answer():
         else:
             raise ValueError("unknown LLM model")
 
-        if settings.LLM_NAME == "openai_chat":
+        if settings.LLM_NAME in ["openai_chat", "gpt4all"]:
             question_generator = LLMChain(llm=llm, prompt=CONDENSE_QUESTION_PROMPT)
             doc_chain = load_qa_chain(llm, chain_type="map_reduce", combine_prompt=p_chat_combine)
             chain = ConversationalRetrievalChain(
@@ -295,19 +285,6 @@ def api_answer():
             # result = chain({"question": question, "chat_history": chat_history})
             # generate async with async generate method
             result = run_async_chain(chain, question, chat_history)
-        elif settings.LLM_NAME == "gpt4all":
-            question_generator = LLMChain(llm=llm, prompt=CONDENSE_QUESTION_PROMPT)
-            doc_chain = load_qa_chain(llm, chain_type="map_reduce", combine_prompt=p_chat_combine)
-            chain = ConversationalRetrievalChain(
-                retriever=docsearch.as_retriever(k=2),
-                question_generator=question_generator,
-                combine_docs_chain=doc_chain,
-            )
-            chat_history = []
-            # result = chain({"question": question, "chat_history": chat_history})
-            # generate async with async generate method
-            result = run_async_chain(chain, question, chat_history)
-
         else:
             qa_chain = load_qa_chain(
                 llm=llm, chain_type="map_reduce", combine_prompt=chat_combine_template, question_prompt=q_prompt
@@ -344,7 +321,7 @@ def api_answer():
     except Exception as e:
         # print whole traceback
         traceback.print_exc()
-        print(str(e))
+        print(e)
         return bad_request(500, str(e))
 
 
@@ -356,26 +333,24 @@ def check_docs():
     if data["docs"].split("/")[0] == "local":
         return {"status": "exists"}
     vectorstore = "vectors/" + data["docs"]
-    base_path = "https://raw.githubusercontent.com/arc53/DocsHUB/main/"
     if os.path.exists(vectorstore) or data["docs"] == "default":
         return {"status": "exists"}
-    else:
-        r = requests.get(base_path + vectorstore + "index.faiss")
+    base_path = "https://raw.githubusercontent.com/arc53/DocsHUB/main/"
+    r = requests.get(base_path + vectorstore + "index.faiss")
 
-        if r.status_code != 200:
-            return {"status": "null"}
-        else:
-            if not os.path.exists(vectorstore):
-                os.makedirs(vectorstore)
-            with open(vectorstore + "index.faiss", "wb") as f:
-                f.write(r.content)
+    if r.status_code != 200:
+        return {"status": "null"}
+    if not os.path.exists(vectorstore):
+        os.makedirs(vectorstore)
+    with open(f"{vectorstore}index.faiss", "wb") as f:
+        f.write(r.content)
 
-            # download the store
-            r = requests.get(base_path + vectorstore + "index.pkl")
-            with open(vectorstore + "index.pkl", "wb") as f:
-                f.write(r.content)
+    # download the store
+    r = requests.get(base_path + vectorstore + "index.pkl")
+    with open(f"{vectorstore}index.pkl", "wb") as f:
+        f.write(r.content)
 
-        return {"status": "loaded"}
+    return {"status": "loaded"}
 
 
 @app.route("/api/feedback", methods=["POST"])
@@ -386,9 +361,9 @@ def api_feedback():
     feedback = data["feedback"]
 
     print("-" * 5)
-    print("Question: " + question)
-    print("Answer: " + answer)
-    print("Feedback: " + feedback)
+    print(f"Question: {question}")
+    print(f"Answer: {answer}")
+    print(f"Feedback: {feedback}")
     print("-" * 5)
     response = requests.post(
         url="https://86x89umx77.execute-api.eu-west-2.amazonaws.com/docsgpt-feedback",
@@ -421,21 +396,20 @@ def combined_json():
     ]
     # structure: name, language, version, description, fullName, date, docLink
     # append data from vectors_collection
-    for index in vectors_collection.find({"user": user}):
-        data.append(
-            {
-                "name": index["name"],
-                "language": index["language"],
-                "version": "",
-                "description": index["name"],
-                "fullName": index["name"],
-                "date": index["date"],
-                "docLink": index["location"],
-                "model": settings.EMBEDDINGS_NAME,
-                "location": "local",
-            }
-        )
-
+    data.extend(
+        {
+            "name": index["name"],
+            "language": index["language"],
+            "version": "",
+            "description": index["name"],
+            "fullName": index["name"],
+            "date": index["date"],
+            "docLink": index["location"],
+            "model": settings.EMBEDDINGS_NAME,
+            "location": "local",
+        }
+        for index in vectors_collection.find({"user": user})
+    )
     data_remote = requests.get("https://d3dg1063dc54p9.cloudfront.net/combined.json").json()
     for index in data_remote:
         index["location"] = "remote"
@@ -461,21 +435,18 @@ def upload_file():
     if file.filename == "":
         return {"status": "no file name"}
 
-    if file:
-        filename = secure_filename(file.filename)
-        # save dir
-        save_dir = os.path.join(app.config["UPLOAD_FOLDER"], user, job_name)
-        # create dir if not exists
-        if not os.path.exists(save_dir):
-            os.makedirs(save_dir)
-
-        file.save(os.path.join(save_dir, filename))
-        task = ingest.delay("temp", [".rst", ".md", ".pdf", ".txt"], job_name, filename, user)
-        # task id
-        task_id = task.id
-        return {"status": "ok", "task_id": task_id}
-    else:
+    if not file:
         return {"status": "error"}
+    filename = secure_filename(file.filename)
+    # save dir
+    save_dir = os.path.join(app.config["UPLOAD_FOLDER"], user, job_name)
+    # create dir if not exists
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+
+    file.save(os.path.join(save_dir, filename))
+    task = ingest.delay("temp", [".rst", ".md", ".pdf", ".txt"], job_name, filename, user)
+    return {"status": "ok", "task_id": task.id}
 
 
 @app.route("/api/task_status", methods=["GET"])
@@ -547,9 +518,7 @@ def delete_old():
 
     path = request.args.get("path")
     dirs = path.split("/")
-    dirs_clean = []
-    for i in range(1, len(dirs)):
-        dirs_clean.append(secure_filename(dirs[i]))
+    dirs_clean = [secure_filename(dirs[i]) for i in range(1, len(dirs))]
     # check that path strats with indexes or vectors
     if dirs[0] not in ["indexes", "vectors"]:
         return {"status": "error"}
